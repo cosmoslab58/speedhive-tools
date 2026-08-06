@@ -3,8 +3,11 @@ from __future__ import annotations
 """Low‑level HTTP clients for the Speedhive API with built-in retry transport."""
 
 import ssl
+import math
 import time
 import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import httpx
@@ -12,8 +15,71 @@ from attrs import define, field, evolve
 
 from speedhive.ratelimit import RateLimiter
 
+# A server asking us to come back much later than this is either misconfigured
+# or telling us to give up. Sleeping on it unbounded would hang the calling
+# thread or event loop inside the transport, so the wait is clamped and the
+# retry budget is left to run out normally.
+DEFAULT_MAX_RETRY_AFTER = 300.0
 
-class HTTPXRetryTransport(httpx.HTTPTransport):
+
+def parse_retry_after(value: Optional[str], now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds to wait per an HTTP ``Retry-After`` header, or None if unusable.
+
+    Both forms in RFC 9110 section 10.2.3 are accepted: delta-seconds
+    (``"120"``) and an HTTP-date (``"Wed, 21 Oct 2015 07:28:00 GMT"``). A date
+    that has already passed means wait zero rather than sleep a negative
+    amount. Anything unparseable answers None so the caller can fall back to
+    its own backoff.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        pass
+    else:
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        # `-0000` and the obsolete formats can come back naive. UTC is the only
+        # sensible reading of an HTTP-date.
+        when = when.replace(tzinfo=timezone.utc)
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - reference).total_seconds())
+
+
+class RetryAfterMixin:
+    """Shared `Retry-After` handling for the sync and async transports."""
+
+    max_retry_after: float
+
+    def _retry_delay(self, exc: Exception, retries: int) -> float:
+        """How long to wait before attempt number ``retries + 1``.
+
+        The server's own schedule wins when it states one. Everything else
+        (no header, an unparseable one, a transport-level error with no
+        response at all) falls back to exponential backoff.
+        """
+        if isinstance(exc, httpx.HTTPStatusError):
+            requested = parse_retry_after(exc.response.headers.get("retry-after"))
+            if requested is not None:
+                return min(requested, self.max_retry_after)
+        return self.backoff_factor * (2 ** (retries - 1))
+
+
+class HTTPXRetryTransport(RetryAfterMixin, httpx.HTTPTransport):
     """Reactive 429/5xx retries, and optionally proactive pacing.
 
     `rate_limiter` is opt-in; without one this behaves exactly as it always
@@ -22,11 +88,20 @@ class HTTPXRetryTransport(httpx.HTTPTransport):
     struggling endpoint applies back pressure instead of attracting more load.
     """
 
-    def __init__(self, max_retries=3, backoff_factor=1.0, rate_limiter: RateLimiter | None = None, *args, **kwargs):
+    def __init__(
+        self,
+        max_retries=3,
+        backoff_factor=1.0,
+        rate_limiter: RateLimiter | None = None,
+        max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.rate_limiter = rate_limiter
+        self.max_retry_after = max_retry_after
 
     def handle_request(self, request, *args, **kwargs):
         if self.rate_limiter is None:
@@ -50,18 +125,26 @@ class HTTPXRetryTransport(httpx.HTTPTransport):
                     if isinstance(exc, httpx.HTTPStatusError):
                         return exc.response
                     raise
-                sleep_time = self.backoff_factor * (2 ** (retries - 1))
-                time.sleep(sleep_time)
+                time.sleep(self._retry_delay(exc, retries))
 
 
-class AsyncHTTPXRetryTransport(httpx.AsyncHTTPTransport):
+class AsyncHTTPXRetryTransport(RetryAfterMixin, httpx.AsyncHTTPTransport):
     """Async counterpart of `HTTPXRetryTransport`, same opt-in pacing."""
 
-    def __init__(self, max_retries=3, backoff_factor=1.0, rate_limiter: RateLimiter | None = None, *args, **kwargs):
+    def __init__(
+        self,
+        max_retries=3,
+        backoff_factor=1.0,
+        rate_limiter: RateLimiter | None = None,
+        max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.rate_limiter = rate_limiter
+        self.max_retry_after = max_retry_after
 
     async def handle_async_request(self, request, *args, **kwargs):
         if self.rate_limiter is None:
@@ -85,8 +168,7 @@ class AsyncHTTPXRetryTransport(httpx.AsyncHTTPTransport):
                     if isinstance(exc, httpx.HTTPStatusError):
                         return exc.response
                     raise
-                sleep_time = self.backoff_factor * (2 ** (retries - 1))
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(self._retry_delay(exc, retries))
 
 
 @define

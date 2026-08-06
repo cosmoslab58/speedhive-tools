@@ -24,6 +24,45 @@ from speedhive.generated.models.time import Time as TimeModel
 from speedhive.utils.lap_analysis import parse_track_record_text
 
 
+def flatten_sessions(payload: Any) -> List[Dict[str, Any]]:
+    """Pull every session out of an event's session listing.
+
+    Sessions usually live under ``groups[].sessions`` with the top-level array
+    empty, and groups can nest arbitrarily deep through ``subGroups``. Missing a
+    nested group silently loses sessions, which downstream looks identical to an
+    event that genuinely had none, so this recurses through both keys.
+
+    Some endpoints answer with a bare JSON array of sessions instead of the
+    grouped object; that form is passed straight through.
+    """
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    found: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def collect(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        for session in node.get("sessions") or []:
+            if not isinstance(session, dict):
+                continue
+            session_id = session.get("id")
+            if session_id is not None:
+                if session_id in seen:
+                    continue
+                seen.add(session_id)
+            found.append(session)
+        for group in node.get("groups") or []:
+            collect(group)
+        for sub_group in node.get("subGroups") or []:
+            collect(sub_group)
+
+    collect(payload)
+    return found
+
 
 @define
 class SpeedhiveClient:
@@ -99,18 +138,7 @@ class SpeedhiveClient:
 
     def get_sessions(self, event_id: int) -> List[Dict[str, Any]]:
         response = get_session_list.sync_detailed(id=event_id, client=self.client)
-        result = self._parse_response(response)
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            sessions = []
-            if isinstance(result.get("sessions"), list):
-                sessions.extend(result["sessions"])
-            for g in result.get("groups", []):
-                if isinstance(g, dict) and isinstance(g.get("sessions"), list):
-                    sessions.extend(g["sessions"])
-            return sessions
-        return []
+        return flatten_sessions(self._parse_response(response))
 
     # Session
     def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
