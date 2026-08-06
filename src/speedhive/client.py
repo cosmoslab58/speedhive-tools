@@ -10,17 +10,36 @@ from typing import Optional
 import httpx
 from attrs import define, field, evolve
 
+from speedhive.ratelimit import RateLimiter
+
 
 class HTTPXRetryTransport(httpx.HTTPTransport):
-    def __init__(self, max_retries=3, backoff_factor=1.0, *args, **kwargs):
+    """Reactive 429/5xx retries, and optionally proactive pacing.
+
+    `rate_limiter` is opt-in; without one this behaves exactly as it always
+    has. With one, a token is taken before *every* attempt, retries included,
+    and the concurrency slot is held for the whole retry sequence so that a
+    struggling endpoint applies back pressure instead of attracting more load.
+    """
+
+    def __init__(self, max_retries=3, backoff_factor=1.0, rate_limiter: RateLimiter | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
+        self.rate_limiter = rate_limiter
 
     def handle_request(self, request, *args, **kwargs):
+        if self.rate_limiter is None:
+            return self._request_with_retries(request, *args, **kwargs)
+        with self.rate_limiter.slot():
+            return self._request_with_retries(request, *args, **kwargs)
+
+    def _request_with_retries(self, request, *args, **kwargs):
         retries = 0
         while True:
             try:
+                if self.rate_limiter is not None:
+                    self.rate_limiter.acquire()
                 response = super().handle_request(request, *args, **kwargs)
                 if response.status_code in (429, 502, 503, 504) and retries < self.max_retries:
                     response.raise_for_status()
@@ -36,15 +55,26 @@ class HTTPXRetryTransport(httpx.HTTPTransport):
 
 
 class AsyncHTTPXRetryTransport(httpx.AsyncHTTPTransport):
-    def __init__(self, max_retries=3, backoff_factor=1.0, *args, **kwargs):
+    """Async counterpart of `HTTPXRetryTransport`, same opt-in pacing."""
+
+    def __init__(self, max_retries=3, backoff_factor=1.0, rate_limiter: RateLimiter | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
+        self.rate_limiter = rate_limiter
 
     async def handle_async_request(self, request, *args, **kwargs):
+        if self.rate_limiter is None:
+            return await self._request_with_retries(request, *args, **kwargs)
+        async with self.rate_limiter.slot_async():
+            return await self._request_with_retries(request, *args, **kwargs)
+
+    async def _request_with_retries(self, request, *args, **kwargs):
         retries = 0
         while True:
             try:
+                if self.rate_limiter is not None:
+                    await self.rate_limiter.acquire_async()
                 response = await super().handle_async_request(request, *args, **kwargs)
                 if response.status_code in (429, 502, 503, 504) and retries < self.max_retries:
                     response.raise_for_status()
@@ -68,16 +98,19 @@ class BaseClient:
     verify_ssl: bool | str | ssl.SSLContext = True
     follow_redirects: bool = False
     raise_on_unexpected_status: bool = False
+    # Opt-in proactive pacing. None keeps the historical behaviour: reactive
+    # backoff only, requests as fast as the caller can issue them.
+    rate_limiter: Optional[RateLimiter] = None
     _client: Optional[httpx.Client] = field(default=None, init=False, repr=False)
     _async_client: Optional[httpx.AsyncClient] = field(default=None, init=False, repr=False)
 
     def _build_client(self, async_mode: bool = False):
         if async_mode:
             cls_ = httpx.AsyncClient
-            transport = AsyncHTTPXRetryTransport(verify=self.verify_ssl)
+            transport = AsyncHTTPXRetryTransport(verify=self.verify_ssl, rate_limiter=self.rate_limiter)
         else:
             cls_ = httpx.Client
-            transport = HTTPXRetryTransport(verify=self.verify_ssl)
+            transport = HTTPXRetryTransport(verify=self.verify_ssl, rate_limiter=self.rate_limiter)
 
         return cls_(
             base_url=self.base_url,

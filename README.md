@@ -85,6 +85,28 @@ session_map = load_session_types_from_storage(storage, 30476)
 most_wins, most_podiums = get_wins_podiums_rankings(results, session_map)
 ```
 
+### Rate limiting
+
+`HTTPXRetryTransport` retries 429/502/503/504 *after* they happen. For bulk work
+against the global feed that is not enough, so a client can also be given a
+proactive token bucket and an in-flight ceiling. It is opt-in: a client without
+one behaves exactly as before.
+
+```python
+from speedhive.client import Client
+from speedhive.ratelimit import RateLimiter
+from speedhive.wrapper import SpeedhiveClient
+
+limiter = RateLimiter(requests_per_second=6.0, max_concurrency=4)
+client = SpeedhiveClient(client=Client(base_url="https://api2.mylaps.com", rate_limiter=limiter))
+
+print(limiter.stats())   # granted, waited_seconds, and the configured limits
+```
+
+The limiter paces every attempt, retries included, and one instance is safe to
+share across threads. `RateLimiter` takes injectable `monotonic` and `sleep`
+callables so pacing can be tested without spending real time.
+
 ## Configuration
 
 | Variable | Description | Default |
