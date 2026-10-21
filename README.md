@@ -21,9 +21,9 @@ Requires Python 3.10+.
   - `analyze_results` — race-results analysis: wins and podiums by class finishing position, and the all-drivers directory (starts/wins/podiums with precomputed ranks).
   - `analyze_class_pace` — average lap time per class by year, and participation-by-year breakdowns.
   - `analyze_driver_laps` — per-driver lap extraction.
-- **`speedhive.settings`** — per-org settings resolution backed by `<SPEEDHIVE_DATA_DIR>/orgs/<org_id>/settings.json`: an org's own override wins, else the global environment default applies (per-org env vars use a `NAME_<org_id>` suffix). Shared by the CLI and host apps, so both always agree on parser engine, Gemini credentials, and min-laps. Email settings are deliberately not part of this — email is host-app policy (`speedhive-tools-ui` uses Resend); the library's only built-in notification path is an optional Gotify push in the curation workflow.
+- **`speedhive.settings`** — per-org settings resolution backed by `<SPEEDHIVE_DATA_DIR>/orgs/<org_id>/settings.json`: an org's own override wins, else the global environment default applies (per-org env vars use a `NAME_<org_id>` suffix). Shared by the CLI and host apps, so both always agree on parser engine, Anthropic credentials, and min-laps. Email settings are deliberately not part of this — email is host-app policy (`speedhive-tools-ui` uses Resend); the library's only built-in notification path is an optional Gotify push in the curation workflow.
 - **`speedhive.exporters`** — NDJSON exporters for every entity, lap records, curated records, and full portable dumps.
-- **`speedhive.llm`** — optional Gemini-based announcer-text extraction, selected per org via settings.
+- **`speedhive.llm`** — optional Claude-based (Anthropic API) announcer-text extraction, selected per org via settings.
 
 ## CLI
 
@@ -55,7 +55,7 @@ speedhive export-db-dump --org 30476 --output-dir ./backup
 speedhive import-dump --org 30476 --dump-dir ./backup
 speedhive export-lap-records --org 30476 -o lap-records.ndjson
 
-# Interactive per-org configuration (parser engine, Gemini key/model, min-laps)
+# Interactive per-org configuration (parser engine, Anthropic key/Claude model, min-laps)
 speedhive configure --org 30476
 ```
 
@@ -113,7 +113,7 @@ callables so pacing can be tested without spending real time.
 | :-- | :-- | :-- |
 | `SPEEDHIVE_DATA_DIR` | Root for per-org settings and data | `./data` |
 | `SPEEDHIVE_DB_PATH` | SQLite database path | `<data dir>/speedhive.db` |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | Gemini credentials for AI-assisted parsing (per-org: `GEMINI_API_KEY_<org_id>`) | unset |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | Anthropic credentials and Claude model for AI-assisted parsing (per-org: `ANTHROPIC_API_KEY_<org_id>`) | key unset; model `claude-haiku-5-5` |
 | `TRACK_RECORDS_STALE_HOURS` | Cache age before `refresh_and_scan` re-syncs | `20` |
 | `GOTIFY_URL` / `GOTIFY_APP_TOKEN` | Optional Gotify push on new record candidates | unset |
 
@@ -121,7 +121,7 @@ Per-org file layout under `SPEEDHIVE_DATA_DIR`:
 
 ```
 orgs/<org_id>/
-├── settings.json             # per-org overrides (parser engine, Gemini, min-laps, alias map path)
+├── settings.json             # per-org overrides (parser engine, Anthropic key, min-laps, alias map path)
 └── track_records/
     ├── curated.ndjson        # approved records (each with its own edit history)
     ├── candidates_pending.ndjson

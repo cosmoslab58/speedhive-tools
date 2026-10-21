@@ -240,21 +240,23 @@ def test_configure_org_wizard_writes_file(tmp_path, monkeypatch):
     assert "overrides" not in data
 
 
-def test_configure_org_wizard_llm_engine_prompts_for_gemini_keys(tmp_path, monkeypatch):
+def test_configure_org_wizard_llm_engine_prompts_for_anthropic_keys(tmp_path, monkeypatch):
     import json as jsonlib
     from speedhive.cli.main import _configure_org
 
     monkeypatch.setenv("SPEEDHIVE_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
     class Args:
         org = 88888
 
     # Mock inputs:
     # 1. Announcer parser engine -> "llm"
-    # 2. Gemini API Key -> "AIza-test-key"
-    # 3. Gemini Model -> "gemini-2.5-pro"
+    # 2. Anthropic API Key -> "sk-ant-test-key"
+    # 3. Claude Model -> "claude-sonnet-5-5"
     # 4. Minimum laps -> Enter (default 20)
-    inputs = ["llm", "AIza-test-key", "gemini-2.5-pro", ""]
+    inputs = ["llm", "sk-ant-test-key", "claude-sonnet-5-5", ""]
     input_iter = iter(inputs)
 
     with patch("builtins.input", lambda prompt: next(input_iter)):
@@ -266,8 +268,33 @@ def test_configure_org_wizard_llm_engine_prompts_for_gemini_keys(tmp_path, monke
 
     assert data["parsing"]["engine"] == "llm"
     assert data["stats"]["min_laps"] == 20
-    assert data["overrides"]["GEMINI_API_KEY"] == "AIza-test-key"
-    assert data["overrides"]["GEMINI_MODEL"] == "gemini-2.5-pro"
+    assert data["overrides"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+    assert data["overrides"]["ANTHROPIC_MODEL"] == "claude-sonnet-5-5"
     assert "notifications" not in data
 
 
+
+
+def test_configure_org_wizard_default_model_is_not_pinned(tmp_path, monkeypatch):
+    import json as jsonlib
+    from speedhive.cli.main import _configure_org
+
+    monkeypatch.setenv("SPEEDHIVE_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+
+    class Args:
+        org = 88888
+
+    # Accept the default model (Enter) -> no ANTHROPIC_MODEL override stored.
+    inputs = ["llm", "sk-ant-test-key", "", ""]
+    input_iter = iter(inputs)
+
+    with patch("builtins.input", lambda prompt: next(input_iter)):
+        _configure_org(Args())
+
+    with open(tmp_path / "orgs" / "88888" / "settings.json") as f:
+        data = jsonlib.load(f)
+
+    assert data["overrides"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+    assert "ANTHROPIC_MODEL" not in data["overrides"]

@@ -1,108 +1,145 @@
-"""LLM client (currently Google Gemini) used by the track-record parsers in
+"""LLM client (Anthropic Claude) used by the track-record parsers in
 speedhive.utils.llm_track_records.
 
-Config is env-var based -- GEMINI_API_KEY / GEMINI_MODEL, or their per-org
-variants GEMINI_API_KEY_<org_id> / GEMINI_MODEL_<org_id> when an org_id is
-given, falling back to the bare name as a shared default. Resolution goes
-through speedhive.settings, which any process (a CLI invocation or a host
-application) resolves the same way.
+Config is env-var based -- ANTHROPIC_API_KEY / ANTHROPIC_MODEL, or their
+per-org variants ANTHROPIC_API_KEY_<org_id> / ANTHROPIC_MODEL_<org_id> when an
+org_id is given, falling back to the bare name as a shared default. Resolution
+goes through speedhive.settings, which any process (a CLI invocation or a host
+application) resolves the same way. The model defaults to DEFAULT_MODEL when
+nothing is configured.
 """
+import copy
 import json
 import os
 from typing import Any, List, Optional
 
-from google import genai
-from google.genai import types
+import anthropic
 
 from speedhive.settings import get_org_env_var
 
+DEFAULT_MODEL = "claude-haiku-5-5"
 
-def get_gemini_api_key(org_id: Optional[int] = None) -> Optional[str]:
+# Extraction is a classification-shaped task; low effort keeps adaptive
+# thinking short and the per-scan cost down.
+DEFAULT_EFFORT = "low"
+
+
+def get_anthropic_api_key(org_id: Optional[int] = None) -> Optional[str]:
     if org_id is not None:
-        return get_org_env_var("GEMINI_API_KEY", org_id)
-    return os.environ.get("GEMINI_API_KEY")
+        return get_org_env_var("ANTHROPIC_API_KEY", org_id)
+    return os.environ.get("ANTHROPIC_API_KEY")
 
 
-def get_gemini_model(org_id: Optional[int] = None) -> Optional[str]:
+def get_anthropic_model(org_id: Optional[int] = None) -> str:
     if org_id is not None:
-        return get_org_env_var("GEMINI_MODEL", org_id)
-    return os.environ.get("GEMINI_MODEL")
+        configured = get_org_env_var("ANTHROPIC_MODEL", org_id)
+    else:
+        configured = os.environ.get("ANTHROPIC_MODEL")
+    return configured or DEFAULT_MODEL
 
 
-def call_gemini_json(
+def _strict_schema(schema: dict) -> dict:
+    """Claude structured outputs require `additionalProperties: false` on every
+    object. The shared schemas in llm_track_records stay provider-neutral, so
+    the adaptation happens here on a copy."""
+    schema = copy.deepcopy(schema)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                node.setdefault("additionalProperties", False)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(schema)
+    return schema
+
+
+def call_claude_json(
     prompt: str,
     response_schema: Optional[dict] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
-    temperature: float = 0.0,
     max_output_tokens: Optional[int] = None,
-    timeout_ms: Optional[int] = None,
+    timeout_s: Optional[float] = None,
+    effort: str = DEFAULT_EFFORT,
     org_id: Optional[int] = None,
 ) -> Any:
-    """Call Gemini and return the parsed JSON response.
+    """Call Claude and return the parsed JSON response.
 
-    Raises RuntimeError if no API key or model is configured, or the underlying
-    google-genai exception if the call itself fails.
+    Raises RuntimeError if no API key is configured or the response is not
+    usable (refusal, truncation), or the underlying anthropic SDK exception if
+    the call itself fails.
     """
-    key = api_key or get_gemini_api_key(org_id)
+    key = api_key or get_anthropic_api_key(org_id)
     if not key:
-        suffix = f" (or GEMINI_API_KEY_{org_id})" if org_id is not None else ""
+        suffix = f" (or ANTHROPIC_API_KEY_{org_id})" if org_id is not None else ""
         raise RuntimeError(
-            f"No Gemini API key configured. Set the GEMINI_API_KEY{suffix} environment variable."
+            f"No Anthropic API key configured. Set the ANTHROPIC_API_KEY{suffix} environment variable."
         )
 
-    model_name = model or get_gemini_model(org_id)
-    if not model_name:
-        suffix = f" (or GEMINI_MODEL_{org_id})" if org_id is not None else ""
-        raise RuntimeError(
-            f"No Gemini model configured. Set the GEMINI_MODEL{suffix} environment variable."
-        )
+    model_name = model or get_anthropic_model(org_id)
 
-    http_options = types.HttpOptions(timeout=timeout_ms) if timeout_ms else None
-    client = genai.Client(api_key=key, http_options=http_options)
-    config_kwargs = {
-        "temperature": temperature,
-        "response_mime_type": "application/json",
-    }
+    client_kwargs: dict = {"api_key": key}
+    if timeout_s:
+        client_kwargs["timeout"] = timeout_s
+    client = anthropic.Anthropic(**client_kwargs)
+
+    output_config: dict = {"effort": effort}
     if response_schema is not None:
-        config_kwargs["response_schema"] = response_schema
-    if max_output_tokens is not None:
-        config_kwargs["max_output_tokens"] = max_output_tokens
+        output_config["format"] = {"type": "json_schema", "schema": _strict_schema(response_schema)}
+    else:
+        prompt = f"{prompt}\n\nRespond with a single JSON value and nothing else."
 
-    response = client.models.generate_content(
+    # Streamed so a large max_tokens (the bulk path) never trips the SDK's
+    # long-request guard or an idle-connection timeout.
+    with client.messages.stream(
         model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(**config_kwargs),
-    )
+        max_tokens=max_output_tokens or 16000,
+        output_config=output_config,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        message = stream.get_final_message()
 
-    return json.loads(response.text)
+    if message.stop_reason == "refusal":
+        raise RuntimeError(f"Claude declined the request ({model_name}).")
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"Claude response truncated at max_tokens={max_output_tokens or 16000} ({model_name})."
+        )
+
+    text = "".join(block.text for block in message.content if block.type == "text")
+    return json.loads(text)
 
 
-def parse_track_record_text_with_gemini(text: str, org_id: Optional[int] = None) -> Optional[dict]:
+def parse_track_record_text_with_claude(text: str, org_id: Optional[int] = None) -> Optional[dict]:
     """Drop-in replacement for speedhive.utils.lap_analysis.parse_track_record_text,
-    backed by the configured Gemini model instead of a regex."""
+    backed by the configured Claude model instead of a regex."""
     from speedhive.utils.llm_track_records import parse_track_record_text_llm
 
     def _call(prompt: str, schema: dict) -> Any:
-        return call_gemini_json(prompt, response_schema=schema, org_id=org_id)
+        return call_claude_json(prompt, response_schema=schema, org_id=org_id)
 
     return parse_track_record_text_llm(text, _call)
 
 
-def parse_track_records_bulk_with_gemini(texts: List[str], org_id: Optional[int] = None) -> List[Optional[dict]]:
+def parse_track_records_bulk_with_claude(texts: List[str], org_id: Optional[int] = None) -> List[Optional[dict]]:
     """Drop-in bulk replacement: parses an entire list of announcement texts
-    in a single Gemini call instead of one call per announcement. Returns a
+    in a single Claude call instead of one call per announcement. Returns a
     list aligned with `texts` (record dict or None per position)."""
     from speedhive.utils.llm_track_records import parse_track_record_texts_llm_bulk
 
     def _call(prompt: str, schema: dict) -> Any:
         # A single call covering hundreds/thousands of announcements needs
         # more room (both to generate and to respond) than the per-item path.
-        return call_gemini_json(
+        return call_claude_json(
             prompt,
             response_schema=schema,
             max_output_tokens=65536,
-            timeout_ms=600_000,
+            timeout_s=600.0,
             org_id=org_id,
         )
 

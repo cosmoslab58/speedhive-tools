@@ -201,6 +201,7 @@ def _export_db_dump(args):
 
 
 def _configure_org(args):
+    from speedhive.llm import DEFAULT_MODEL
     from speedhive.settings import org_settings_path, read_org_settings, write_org_settings
 
     # If org is not passed via CLI, prompt for it
@@ -227,8 +228,8 @@ def _configure_org(args):
     min_laps_default = stats.get("min_laps", 20)
 
     overrides = config.get("overrides", {})
-    gemini_key_default = overrides.get("GEMINI_API_KEY", os.environ.get(f"GEMINI_API_KEY_{org_id}", os.environ.get("GEMINI_API_KEY", "")))
-    gemini_model_default = overrides.get("GEMINI_MODEL", os.environ.get(f"GEMINI_MODEL_{org_id}", os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")))
+    anthropic_key_default = overrides.get("ANTHROPIC_API_KEY", os.environ.get(f"ANTHROPIC_API_KEY_{org_id}", os.environ.get("ANTHROPIC_API_KEY", "")))
+    anthropic_model_default = overrides.get("ANTHROPIC_MODEL", os.environ.get(f"ANTHROPIC_MODEL_{org_id}", os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)))
 
     print(f"\n--- Configuring Organization {org_id} ---")
     print(f"Configuration file will be saved to: {settings_file.resolve()}\n")
@@ -259,11 +260,15 @@ def _configure_org(args):
     # Prompt user
     parser_engine = prompt_choices("Announcer parser engine", ["regex", "llm"], parser_default)
 
-    gemini_key = ""
-    gemini_model = ""
+    anthropic_key = ""
+    anthropic_model = ""
     if parser_engine == "llm":
-        gemini_key = prompt_text("Gemini API Key", gemini_key_default, is_secret=True)
-        gemini_model = prompt_text("Gemini Model", gemini_model_default)
+        anthropic_key = prompt_text("Anthropic API Key", anthropic_key_default, is_secret=True)
+        anthropic_model = prompt_text("Claude Model", anthropic_model_default)
+        # Accepting the built-in default stores nothing, so the org keeps
+        # following DEFAULT_MODEL instead of being pinned to today's value.
+        if anthropic_model == DEFAULT_MODEL:
+            anthropic_model = ""
 
     min_laps = 20
     try:
@@ -281,8 +286,8 @@ def _configure_org(args):
         config["overrides"] = {}
 
     for key, val in [
-        ("GEMINI_API_KEY", gemini_key),
-        ("GEMINI_MODEL", gemini_model),
+        ("ANTHROPIC_API_KEY", anthropic_key),
+        ("ANTHROPIC_MODEL", anthropic_model),
     ]:
         if val:
             config["overrides"][key] = val
@@ -301,7 +306,7 @@ def _configure_org(args):
 def main():
     from dotenv import load_dotenv
     load_dotenv()
-    # Per-org overrides (GEMINI_API_KEY_<org>, etc.) live in
+    # Per-org overrides (ANTHROPIC_API_KEY_<org>, etc.) live in
     # <SPEEDHIVE_DATA_DIR>/orgs/<org_id>/settings.json -- see speedhive.settings.
 
     parser = argparse.ArgumentParser(description="Speedhive Tools")

@@ -1,11 +1,21 @@
 import json
+from types import SimpleNamespace
 
-from speedhive.llm import get_gemini_api_key, get_gemini_model
+import pytest
+from speedhive.llm import (
+    DEFAULT_MODEL,
+    call_claude_json,
+    get_anthropic_api_key,
+    get_anthropic_model,
+    parse_track_records_bulk_with_claude,
+)
+from speedhive.storage import SpeedhiveStorage
 from speedhive.utils.llm_track_records import (
+    BULK_TRACK_RECORD_RESPONSE_SCHEMA,
+    TRACK_RECORD_RESPONSE_SCHEMA,
     parse_track_record_text_llm,
     parse_track_record_texts_llm_bulk,
 )
-from speedhive.storage import SpeedhiveStorage
 
 
 def _fake_call(response):
@@ -14,37 +24,153 @@ def _fake_call(response):
     return call
 
 
-def test_get_gemini_api_key_prefers_org_scoped_over_bare(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY_88888", raising=False)
+def test_get_anthropic_api_key_prefers_org_scoped_over_bare(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY_88888", raising=False)
 
-    assert get_gemini_api_key() is None
-    assert get_gemini_api_key(org_id=88888) is None
+    assert get_anthropic_api_key() is None
+    assert get_anthropic_api_key(org_id=88888) is None
 
-    monkeypatch.setenv("GEMINI_API_KEY", "bare-key")
-    assert get_gemini_api_key() == "bare-key"
-    assert get_gemini_api_key(org_id=88888) == "bare-key", "falls back to the bare var when no org-scoped one is set"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "bare-key")
+    assert get_anthropic_api_key() == "bare-key"
+    assert get_anthropic_api_key(org_id=88888) == "bare-key", "falls back to the bare var when no org-scoped one is set"
 
-    monkeypatch.setenv("GEMINI_API_KEY_88888", "org-specific-key")
-    assert get_gemini_api_key(org_id=88888) == "org-specific-key", "org-scoped var takes priority"
-    assert get_gemini_api_key(org_id=99999) == "bare-key", "a different org still falls back to the bare var"
-    assert get_gemini_api_key() == "bare-key", "no org_id given -- unaffected by any org-scoped var"
+    monkeypatch.setenv("ANTHROPIC_API_KEY_88888", "org-specific-key")
+    assert get_anthropic_api_key(org_id=88888) == "org-specific-key", "org-scoped var takes priority"
+    assert get_anthropic_api_key(org_id=99999) == "bare-key", "a different org still falls back to the bare var"
+    assert get_anthropic_api_key() == "bare-key", "no org_id given -- unaffected by any org-scoped var"
 
 
-def test_get_gemini_model_prefers_org_scoped_and_falls_back_to_global(monkeypatch):
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    monkeypatch.delenv("GEMINI_MODEL_88888", raising=False)
+def test_get_anthropic_model_prefers_org_scoped_then_global_then_default(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL_88888", raising=False)
 
-    assert get_gemini_model() is None
-    assert get_gemini_model(org_id=88888) is None
+    assert get_anthropic_model() == DEFAULT_MODEL == "claude-haiku-5-5"
+    assert get_anthropic_model(org_id=88888) == DEFAULT_MODEL
 
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-bare")
-    assert get_gemini_model() == "gemini-bare"
-    assert get_gemini_model(org_id=88888) == "gemini-bare"
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-bare")
+    assert get_anthropic_model() == "claude-bare"
+    assert get_anthropic_model(org_id=88888) == "claude-bare"
 
-    monkeypatch.setenv("GEMINI_MODEL_88888", "gemini-org-specific")
-    assert get_gemini_model(org_id=88888) == "gemini-org-specific"
-    assert get_gemini_model(org_id=99999) == "gemini-bare"
+    monkeypatch.setenv("ANTHROPIC_MODEL_88888", "claude-org-specific")
+    assert get_anthropic_model(org_id=88888) == "claude-org-specific"
+    assert get_anthropic_model(org_id=99999) == "claude-bare"
+
+
+class _FakeStream:
+    def __init__(self, message):
+        self._message = message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return self._message
+
+
+def _install_fake_client(monkeypatch, text, stop_reason="end_turn"):
+    """Replace anthropic.Anthropic in speedhive.llm with a fake that records
+    the constructor and stream kwargs and returns a canned message."""
+    import speedhive.llm as llm_mod
+
+    calls = {}
+    message = SimpleNamespace(
+        stop_reason=stop_reason,
+        content=[
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text=text),
+        ],
+    )
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            calls["stream"] = kwargs
+            return _FakeStream(message)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr(llm_mod.anthropic, "Anthropic", FakeClient)
+    return calls
+
+
+def test_call_claude_json_sends_strict_schema_and_parses_text(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    calls = _install_fake_client(monkeypatch, '{"is_record": false}')
+
+    result = call_claude_json("prompt text", response_schema=TRACK_RECORD_RESPONSE_SCHEMA)
+
+    assert result == {"is_record": False}
+    assert calls["client"]["api_key"] == "test-key"
+    sent = calls["stream"]
+    assert sent["model"] == "claude-haiku-5-5"
+    assert sent["messages"] == [{"role": "user", "content": "prompt text"}]
+    assert sent["output_config"]["effort"] == "low"
+    assert "temperature" not in sent and "thinking" not in sent
+    fmt = sent["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["additionalProperties"] is False
+    # The shared provider-neutral schema itself is left untouched.
+    assert "additionalProperties" not in TRACK_RECORD_RESPONSE_SCHEMA
+
+
+def test_call_claude_json_bulk_schema_marks_nested_objects_strict(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls = _install_fake_client(monkeypatch, '{"results": []}')
+
+    call_claude_json("p", response_schema=BULK_TRACK_RECORD_RESPONSE_SCHEMA, max_output_tokens=65536, timeout_s=600.0)
+
+    schema = calls["stream"]["output_config"]["format"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["results"]["items"]["additionalProperties"] is False
+    assert calls["stream"]["max_tokens"] == 65536
+    assert calls["client"]["timeout"] == 600.0
+
+
+def test_call_claude_json_org_key_wins(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "bare-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY_88888", "org-key")
+    monkeypatch.setenv("ANTHROPIC_MODEL_88888", "claude-org-model")
+    calls = _install_fake_client(monkeypatch, "{}")
+
+    call_claude_json("p", response_schema={"type": "object", "properties": {}}, org_id=88888)
+
+    assert calls["client"]["api_key"] == "org-key"
+    assert calls["stream"]["model"] == "claude-org-model"
+
+
+def test_call_claude_json_without_key_raises(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY_88888", raising=False)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY_88888"):
+        call_claude_json("p", org_id=88888)
+
+
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_call_claude_json_unusable_stop_reason_raises(monkeypatch, stop_reason):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _install_fake_client(monkeypatch, '{"is_rec', stop_reason=stop_reason)
+    with pytest.raises(RuntimeError):
+        call_claude_json("p", response_schema={"type": "object", "properties": {}})
+
+
+def test_parse_track_records_bulk_with_claude_end_to_end(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    payload = {"results": [{"index": 1, "classification": "FA", "lap_time": "1:01.861", "driver": "Jane Doe"}]}
+    _install_fake_client(monkeypatch, json.dumps(payload))
+
+    out = parse_track_records_bulk_with_claude(["nothing here", "New Track Record ..."])
+
+    assert out[0] is None
+    assert out[1]["classification"] == "FA"
+    assert out[1]["lap_time_seconds"] == pytest.approx(61.861)
+    assert out[1]["llm_uncertain"] is False
 
 
 def test_parse_track_record_text_llm_found():

@@ -1,7 +1,7 @@
 """Per-organization settings resolution, shared by the CLI and any host
 application (e.g. speedhive-tools-ui).
 
-Every organization's config -- Gemini keys, the announcer-text parsing
+Every organization's config -- Anthropic keys, the announcer-text parsing
 engine, the minimum-lap threshold for consistency stats, and (for a host
 application) its own overrides -- lives in a single JSON file:
 
@@ -14,7 +14,7 @@ env var at its own data directory -- there is no dependency on any
 particular app.
 
 This module only knows about settings speedhive-tools itself has code paths
-for (Gemini keys, parsing engine, min-laps). It never references
+for (Anthropic keys, parsing engine, min-laps). It never references
 notification/email settings (RESEND_API_KEY, NOTIFICATION_*) -- those are
 policy owned entirely by whatever host application is built on top, resolved
 through the same generic get_org_env_var/set_org_env_var functions below.
@@ -119,7 +119,7 @@ def set_org_env_var(name: str, org_id: int, value: Optional[str]) -> None:
 
 def get_parsing_engine(org_id: int) -> str:
     """The announcer-text parser configured for this org's track-record
-    scans: 'regex' (default) or 'llm' (Gemini), set via 'parsing.engine' in
+    scans: 'regex' (default) or 'llm' (Claude), set via 'parsing.engine' in
     the org's settings.json."""
     engine = (read_org_settings(org_id).get("parsing") or {}).get("engine")
     return engine if engine == "llm" else "regex"
@@ -128,7 +128,7 @@ def get_parsing_engine(org_id: int) -> str:
 def get_bulk_parser_for_org(org_id: int) -> Optional[Callable]:
     """Return the bulk announcement parser configured for this org's scans.
 
-    Regex is the default for every org -- LLM (Gemini) is opt-in per org via
+    Regex is the default for every org -- LLM (Claude) is opt-in per org via
     'parsing.engine': 'llm' in the org's settings.json. When LLM is active,
     all of the org's announcements are parsed in a single call rather than
     one call per announcement -- storage.get_track_records() falls back to
@@ -138,8 +138,8 @@ def get_bulk_parser_for_org(org_id: int) -> Optional[Callable]:
     if get_parsing_engine(org_id) != "llm":
         return None
     import functools
-    from speedhive.llm import parse_track_records_bulk_with_gemini
-    return functools.partial(parse_track_records_bulk_with_gemini, org_id=org_id)
+    from speedhive.llm import parse_track_records_bulk_with_claude
+    return functools.partial(parse_track_records_bulk_with_claude, org_id=org_id)
 
 
 def get_stats_min_laps(org_id: int) -> int:
