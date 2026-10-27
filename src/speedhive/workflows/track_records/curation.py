@@ -432,7 +432,7 @@ def delete_curated_record(p, identity):
     return {"found": True, "permanent": False, "record": target}
 
 
-def restore_rejected_record(org_id, storage, track_records_root, identity):
+def restore_rejected_record(org_id, storage, track_records_root, identity, bulk_parser=None):
     """Undo a rejection/deletion by identity: unblock it and let a fresh
     scan decide whether it still qualifies as a candidate. Applies equally
     whether the rejection came from deleting a curated record or rejecting
@@ -442,6 +442,10 @@ def restore_rejected_record(org_id, storage, track_records_root, identity):
     Returns a dict describing the outcome for the caller to build a notice
     from: {"found": False}, or {"found": True, "reappeared": Optional[bool],
     "rescan_error": Optional[str]}.
+
+    Pass the org's `bulk_parser` when it uses the LLM parser: the rescan
+    otherwise falls back to regex, which throws away the LLM parse cache and
+    can reject rows the LLM parsed fine.
     """
     p = paths_for_org(track_records_root, org_id)
     rejected_payload = load_rejected(p)
@@ -454,7 +458,7 @@ def restore_rejected_record(org_id, storage, track_records_root, identity):
     save_rejected(p, rejected_payload)
 
     try:
-        run_sync_and_diff(org_id, storage, track_records_root)
+        run_sync_and_diff(org_id, storage, track_records_root, bulk_parser=bulk_parser)
         reappeared = any(
             c.get("proposed", {}).get("classAbbreviation") == identity[0]
             and c.get("proposed", {}).get("lapTime") == identity[1]
@@ -539,6 +543,11 @@ def get_cache_status(org_id, storage, track_records_root, client=None):
                             if updated_at:
                                 try:
                                     updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                                    # Speedhive sends updatedAt without an offset; comparing
+                                    # that naive value with last_dt raised TypeError, which the
+                                    # except below swallowed, so updates were never seen.
+                                    if updated_dt.tzinfo is None:
+                                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
                                     if updated_dt > last_dt:
                                         has_updates = True
                                         break
@@ -756,6 +765,11 @@ def run_sync_and_diff(org_id, storage, track_records_root, progress_cb=None, par
         "org_id": org_id,
         "candidates": candidates,
     }
+    # Carry the notification de-dup marker across rescans, or every rescan
+    # (one runs after each curated edit) re-sends the same candidates email.
+    previous_fingerprint = load_candidates(p).get("last_notified_fingerprint")
+    if previous_fingerprint is not None:
+        payload["last_notified_fingerprint"] = previous_fingerprint
     save_candidates(p, payload)
 
     if auto_rejected:

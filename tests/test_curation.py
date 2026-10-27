@@ -465,3 +465,32 @@ def test_driver_names_match_ignores_a_generational_suffix():
     assert curation.driver_names_match("J. Lewis Cooper, Jr", "J Lewis Cooper Jr")
     assert curation.driver_names_match("John Edgell III", "John Edgell")
     assert not curation.driver_names_match("Jerry Morlewski, Jr", "Jerry Smith")
+
+
+def test_rescan_keeps_the_notification_fingerprint(tmp_path):
+    """Every curated edit triggers a rescan; dropping the de-dup marker there
+    re-sent the same candidates email each time."""
+    from speedhive.storage import SpeedhiveStorage
+
+    org_id = 779
+    storage = SpeedhiveStorage(tmp_path / "cache.db")
+    p = curation.paths_for_org(tmp_path, org_id)
+    p["dir"].mkdir(parents=True)
+    _seed_announcement(storage, org_id, session_id=300, event_id=1, texts_with_ts=[
+        {"text": "New Track Record (1:01.861) for FA by Bob.", "timestamp": "2026-07-16"},
+    ])
+    curation.run_sync_and_diff(org_id, storage, tmp_path)
+    payload = curation.load_candidates(p)
+    payload["last_notified_fingerprint"] = "fp-1"
+    curation.save_candidates(p, payload)
+
+    curation.run_sync_and_diff(org_id, storage, tmp_path)
+    assert curation.load_candidates(p)["last_notified_fingerprint"] == "fp-1"
+
+
+def test_atomic_write_leaves_no_temp_files(tmp_path):
+    target = tmp_path / "curated.ndjson"
+    store.save_curated({"dir": tmp_path, "curated": target}, {"date": "2026-01-01", "records": [{"a": 1}]})
+    store.save_curated({"dir": tmp_path, "curated": target}, {"date": "2026-01-02", "records": [{"a": 2}]})
+    assert [f.name for f in tmp_path.iterdir()] == ["curated.ndjson"]
+    assert store.load_curated({"curated": target})["records"] == [{"a": 2}]

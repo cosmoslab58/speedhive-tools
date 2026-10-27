@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from speedhive.ndjson import load_ndjson, save_ndjson
+from speedhive.ndjson import atomic_write_text, load_ndjson, save_ndjson
 
 
 def org_track_records_dir(track_records_root: Path, org_id: int) -> Path:
@@ -34,11 +34,7 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def load_curated(p):

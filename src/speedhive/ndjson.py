@@ -7,6 +7,8 @@ line. Loaders return plain dicts shaped ``{**meta, records_key: [rows]}``.
 """
 import gzip
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -32,12 +34,31 @@ def dumps_ndjson(doc: Dict[str, Any], records_key: str) -> str:
     return "\n".join(iter_ndjson_lines(doc, records_key)) + "\n"
 
 
-def save_ndjson(path, doc: Dict[str, Any], records_key: str) -> None:
+def atomic_write_text(path, text: str) -> None:
+    """Replace a file's contents all at once.
+
+    Writing in place truncates first, so a reader in the middle of it (the
+    public feed, say) sees half a file, and a crash leaves one. Writing a
+    sibling temp file and renaming it over the original means readers only
+    ever see the old contents or the new.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for line in iter_ndjson_lines(doc, records_key):
-            f.write(line + "\n")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def save_ndjson(path, doc: Dict[str, Any], records_key: str) -> None:
+    atomic_write_text(path, "".join(line + "\n" for line in iter_ndjson_lines(doc, records_key)))
 
 
 def write_ndjson_record(handle, payload: Any) -> None:
