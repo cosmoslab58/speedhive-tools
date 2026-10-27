@@ -15,6 +15,7 @@ Works for any org_id; nothing here is specific to any one club/organization.
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -65,6 +66,43 @@ def lap_time_to_seconds(lap_time):
         return float(parts[0])
     except ValueError:
         return None
+
+
+# Only laps set in a race count as track records. Speedhive's session `type`
+# can't be trusted on its own -- older uploads tag "Saturday Class Race" as
+# qualify and drivers-school "Practice Starts and Races" as race -- so the
+# session name decides first and the type only breaks a tie. Grid sheets are
+# not races: their times are the qualifying laps the grid was built from.
+_DUAL_PURPOSE_RACE = re.compile(
+    r"race\b[^/]*/\s*scca qual|qualifying whrri race|whrri (class )?race \+ qualifying|race\s*\+\s*glc qual",
+    re.IGNORECASE,
+)
+_NON_RACE_SESSION = re.compile(
+    r"qualif|\bqual\b|grid|practice|preactice|warm ?up|lunch|break|time trial|\btt\b|bracket|\bbr\b"
+    r"|test|transponder|setup|instructor|summary|\blist\b|overall results",
+    re.IGNORECASE,
+)
+_RACE_SESSION = re.compile(
+    r"race|feature|showcase|show case|invitational|enduro|endurance|shoot ?out|smoke|big.bore"
+    r"|i\.?t\.? ?fest|challenge|co-?driver",
+    re.IGNORECASE,
+)
+
+
+def is_race_session(session_name, session_type=None):
+    """True if a session is a race, so a lap set in it can be a track record.
+
+    With no name and no type there is no evidence either way, and the session
+    is treated as a race rather than silently dropping its announcements.
+    """
+    name = (session_name or "").replace("_", " ")
+    if _DUAL_PURPOSE_RACE.search(name):
+        return True
+    if _NON_RACE_SESSION.search(name):
+        return False
+    if _RACE_SESSION.search(name):
+        return True
+    return session_type in (None, "race")
 
 
 def notify_gotify(title, message):
@@ -131,6 +169,17 @@ def lap_times_match(a, b, tolerance=LAP_TIME_MATCH_TOLERANCE_SECONDS):
     return abs(secs_a - secs_b) <= tolerance
 
 
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+
+def _strip_name_suffix(tokens):
+    """Drop a trailing generational suffix, so 'Jerry Morlewski, Jr' and
+    'Jerry Morlewski' compare on the surname rather than on 'jr'."""
+    if len(tokens) > 2 and tokens[-1] in _NAME_SUFFIXES:
+        return tokens[:-1]
+    return tokens
+
+
 def driver_names_match(a, b):
     """True if two driver names plausibly refer to the same person, tolerating
     a missing middle name/initial (e.g. curated 'Andrew Abbott' vs raw
@@ -141,8 +190,8 @@ def driver_names_match(a, b):
     on first + last token only, so an extra/missing middle token doesn't
     prevent a match while still requiring both ends of the name to agree.
     """
-    tokens_a = normalize_name(a).split()
-    tokens_b = normalize_name(b).split()
+    tokens_a = _strip_name_suffix(normalize_name(a).split())
+    tokens_b = _strip_name_suffix(normalize_name(b).split())
     if not tokens_a or not tokens_b:
         return False
     if tokens_a == tokens_b:
@@ -630,7 +679,18 @@ def run_sync_and_diff(org_id, storage, track_records_root, progress_cb=None, par
         # entirely and goes straight to rejected. It's still visible and
         # restorable from the Rejected tab if that turns out to be wrong;
         # it just isn't presented as something to decide on.
-        if status != "ok" or row.get("llm_uncertain"):
+        #
+        # A lap announced outside a race (qualifying, practice, a grid sheet)
+        # is never a track record, so it goes the same way.
+        if not is_race_session(row.get("session_name"), row.get("session_type")):
+            reason = "not_a_race_session"
+        elif status != "ok":
+            reason = status
+        elif row.get("llm_uncertain"):
+            reason = "llm_uncertain"
+        else:
+            reason = None
+        if reason:
             key = rejected_key(row.get("classification"), row.get("lap_time"), row.get("driver"), date_str)
             if key in rejected_keys or key in seen_flagged_keys:
                 continue
@@ -643,7 +703,7 @@ def run_sync_and_diff(org_id, storage, track_records_root, progress_cb=None, par
                 "marque": row.get("marque"),
                 "date": date_str,
                 "rejected_at": _utc_now_iso(),
-                "reason": status if status != "ok" else "llm_uncertain",
+                "reason": reason,
             })
             continue
 

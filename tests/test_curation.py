@@ -141,12 +141,12 @@ def test_delete_curated_record_normalization(tmp_path):
     assert raw_ldc_2 in rejected_ldc
 
 
-def _seed_announcement(storage, org_id, session_id, event_id, texts_with_ts):
+def _seed_announcement(storage, org_id, session_id, event_id, texts_with_ts, session_payload=None):
     with storage.connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO sessions (session_id, event_id, org_id, name, session_type, payload, saved_at) "
             "VALUES (?,?,?,?,?,?,?)",
-            (session_id, event_id, org_id, "Race 1", "race", "{}", "2026-01-01T00:00:00Z"),
+            (session_id, event_id, org_id, "Race 1", "race", json.dumps(session_payload or {}), "2026-01-01T00:00:00Z"),
         )
         conn.execute(
             "INSERT OR REPLACE INTO events (event_id, org_id, name, starts_at, payload, saved_at) VALUES (?,?,?,?,?,?)",
@@ -405,3 +405,63 @@ def test_dedupe_curated_speedhive_additions_catches_format_variants(tmp_path):
         ("GT3", "manual"), ("P1", "manual"), ("FV", "manual"), ("FP", "speedhive"),
     }
 
+
+
+def test_is_race_session_reads_the_name_before_the_type():
+    races = [
+        ("Group 6 Feature Race - CFC;F5;FA;FB;FC", "race"),
+        ("Saturday Class Race", "qualify"),  # older uploads mis-type races as qualify
+        ("Group 1 Sunday Class Race / SCCA Qualifying - EP;FP", "race"),
+        ("Group 3 Sunday Qualifying WHRRI Race - SR,SRF,SRF3", "race"),
+        ("Group 8 Big Bore Bash", "race"),
+        ("Group 13", "race"),  # no keywords: the type decides
+        (None, None),  # nothing to go on: not dropped
+    ]
+    non_races = [
+        ("Group 1 Qualifying - EP;FP;GTL;HP;ITA;ITS;T4", "qualify"),
+        ("GRID SATURDAY RACE GROUP 5", "qualify"),  # a grid sheet holds qualifying laps
+        ("Practice Starts and Races", "race"),  # drivers school, mis-typed as race
+        ("Saturday BR Competition", "race"),  # bracket racing
+        ("Group 2", "qualify"),
+    ]
+    for name, session_type in races:
+        assert curation.is_race_session(name, session_type), name
+    for name, session_type in non_races:
+        assert not curation.is_race_session(name, session_type), name
+
+
+def test_scan_auto_rejects_records_announced_outside_a_race(tmp_path):
+    """Only race laps count: a record announced in qualifying goes straight to
+    rejected with a reason, never into the review queue."""
+    from speedhive.storage import SpeedhiveStorage
+
+    org_id = 778
+    storage = SpeedhiveStorage(tmp_path / "cache.db")
+    p = curation.paths_for_org(tmp_path, org_id)
+    p["dir"].mkdir(parents=True)
+
+    _seed_announcement(storage, org_id, session_id=200, event_id=1, texts_with_ts=[
+        {"text": "New Track Record (1:06.493) for F6 by Sven de Vries.", "timestamp": "2019-05-04"},
+    ], session_payload={"name": "Qualifying", "type": "qualify"})
+    _seed_announcement(storage, org_id, session_id=201, event_id=1, texts_with_ts=[
+        {"text": "New Track Record (1:07.284) for F6 by Sven de Vries.", "timestamp": "2019-05-04"},
+    ], session_payload={"name": "Saturday Race 2", "type": "race"})
+
+    result = curation.run_sync_and_diff(org_id, storage, tmp_path)
+    assert result["candidates_found"] == 1
+    candidates = curation.load_candidates(p)["candidates"]
+    assert candidates[0]["proposed"]["lapTime"] == "1:07.284"
+
+    rejected = curation.load_rejected(p)["rejected"]
+    assert [(r["lapTime"], r["reason"]) for r in rejected] == [("1:06.493", "not_a_race_session")]
+
+    # A second scan doesn't reject the same lap twice.
+    curation.run_sync_and_diff(org_id, storage, tmp_path)
+    assert len(curation.load_rejected(p)["rejected"]) == 1
+
+
+def test_driver_names_match_ignores_a_generational_suffix():
+    assert curation.driver_names_match("Jerry Morlewski, Jr", "Jerry Morlewski")
+    assert curation.driver_names_match("J. Lewis Cooper, Jr", "J Lewis Cooper Jr")
+    assert curation.driver_names_match("John Edgell III", "John Edgell")
+    assert not curation.driver_names_match("Jerry Morlewski, Jr", "Jerry Smith")

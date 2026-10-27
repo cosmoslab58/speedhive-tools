@@ -823,6 +823,7 @@ class SpeedhiveStorage:
                 or session_raw.get("eventName")
             )
             session_name = session_raw.get("name") or session_raw.get("sessionName")
+            session_type = session_raw.get("type")
 
             for announcement in announcements:
                 if not isinstance(announcement, dict):
@@ -833,6 +834,7 @@ class SpeedhiveStorage:
                     "event_id": event_id,
                     "event_name": event_name,
                     "session_name": session_name,
+                    "session_type": session_type,
                     "text": text,
                     "key": _announcement_scan_key(session_id, text),
                     "timestamp": (
@@ -878,6 +880,7 @@ class SpeedhiveStorage:
                     "event_name": item["event_name"],
                     "session_id": int(item["session_id"]),
                     "session_name": item["session_name"],
+                    "session_type": item["session_type"],
                     "classification": parsed.get("classification"),
                     "lap_time": parsed.get("lap_time"),
                     "lap_time_seconds": parsed.get("lap_time_seconds"),
